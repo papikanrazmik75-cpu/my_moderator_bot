@@ -13,6 +13,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.types import Message, BotCommand, Update
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,8 +32,16 @@ SETTINGS_FILE = "settings.json"
 WATCHDOG_INTERVAL_SEC = int(os.getenv("WATCHDOG_INTERVAL_SEC", "60"))
 API_CHECK_TIMEOUT_SEC = int(os.getenv("API_CHECK_TIMEOUT_SEC", "15"))
 POLLING_RESTART_DELAY_SEC = int(os.getenv("POLLING_RESTART_DELAY_SEC", "5"))
+POLLING_TIMEOUT_SEC = int(os.getenv("POLLING_TIMEOUT_SEC", "30"))
+SESSION_TIMEOUT_SEC = int(os.getenv("SESSION_TIMEOUT_SEC", "60"))
+STALE_RESTART_AFTER_SEC = int(os.getenv("STALE_RESTART_AFTER_SEC", "180"))
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+session = AiohttpSession(timeout=SESSION_TIMEOUT_SEC)
+bot = Bot(
+    token=TOKEN,
+    session=session,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
 dp = Dispatcher()
 
 bot_state: Dict[str, Any] = {
@@ -233,7 +242,7 @@ async def welcome_new_member(message: Message):
 async def check_links(message: Message):
     if message.text and message.text.startswith("/"):
         return
-    if message.from_user.is_bot:
+    if message.from_user is None or message.from_user.is_bot:
         return
     if not message.text:
         return
@@ -321,43 +330,73 @@ def is_bot_healthy() -> bool:
     return bool(bot_state["polling_active"] and bot_state["last_api_ok"])
 
 
-async def watchdog():
+async def _polling_once():
+    bot_state["polling_active"] = True
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await set_commands()
+        logger.info("Starting Telegram polling (timeout=%ss)", POLLING_TIMEOUT_SEC)
+        await dp.start_polling(
+            bot,
+            handle_signals=False,
+            polling_timeout=POLLING_TIMEOUT_SEC,
+        )
+    finally:
+        bot_state["polling_active"] = False
+
+
+async def supervisor():
     logger.info(
-        "Watchdog started (interval=%ss, api_timeout=%ss)",
+        "Supervisor started (watchdog=%ss, api_timeout=%ss, stale_restart=%ss)",
         WATCHDOG_INTERVAL_SEC,
         API_CHECK_TIMEOUT_SEC,
+        STALE_RESTART_AFTER_SEC,
     )
     while True:
-        await asyncio.sleep(WATCHDOG_INTERVAL_SEC)
-        api_ok = await check_telegram_api()
-        logger.info(
-            "Watchdog heartbeat: polling_active=%s api_ok=%s updates=%s handler_errors=%s restarts=%s last_update=%s",
-            bot_state["polling_active"],
-            api_ok,
-            bot_state["updates_handled"],
-            bot_state["handler_errors"],
-            bot_state["polling_restarts"],
-            bot_state["last_update_at"],
-        )
-        if not bot_state["polling_active"]:
-            logger.error("Watchdog detected inactive polling")
+        consecutive_api_failures = 0
+        polling_task = asyncio.create_task(_polling_once(), name="tg-polling")
 
+        while True:
+            done, _ = await asyncio.wait({polling_task}, timeout=WATCHDOG_INTERVAL_SEC)
+            if polling_task in done:
+                break
 
-async def run_bot():
-    while True:
+            api_ok = await check_telegram_api()
+            logger.info(
+                "Heartbeat: polling_active=%s api_ok=%s updates=%s handler_errors=%s "
+                "restarts=%s last_update=%s last_handler=%s",
+                bot_state["polling_active"],
+                api_ok,
+                bot_state["updates_handled"],
+                bot_state["handler_errors"],
+                bot_state["polling_restarts"],
+                bot_state["last_update_at"],
+                bot_state["last_handler_at"],
+            )
+
+            if api_ok:
+                consecutive_api_failures = 0
+                continue
+
+            consecutive_api_failures += 1
+            stale_for = consecutive_api_failures * WATCHDOG_INTERVAL_SEC
+            logger.error(
+                "Watchdog: API unreachable for ~%ss (failure #%s)",
+                stale_for,
+                consecutive_api_failures,
+            )
+            if stale_for >= STALE_RESTART_AFTER_SEC:
+                logger.error("Watchdog: forcing polling restart (stale/hung detected)")
+                polling_task.cancel()
+                break
+
         try:
-            bot_state["polling_active"] = True
-            await bot.delete_webhook(drop_pending_updates=False)
-            await set_commands()
-            logger.info("Starting Telegram polling")
-            await dp.start_polling(bot, handle_signals=False)
-            logger.warning("Polling exited without exception")
+            await polling_task
+            logger.warning("Polling task ended without exception")
         except asyncio.CancelledError:
-            bot_state["polling_active"] = False
-            logger.info("Polling task cancelled")
-            raise
+            logger.warning("Polling task was cancelled by watchdog")
         except Exception:
-            logger.exception("Polling crashed")
+            logger.exception("Polling task crashed")
         finally:
             bot_state["polling_active"] = False
 
@@ -447,7 +486,7 @@ async def main():
     logger.info("=" * 50)
 
     await check_telegram_api()
-    await asyncio.gather(start_health_server(), watchdog(), run_bot())
+    await asyncio.gather(start_health_server(), supervisor())
 
 
 if __name__ == "__main__":
