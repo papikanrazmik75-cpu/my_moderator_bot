@@ -1,14 +1,26 @@
 import os
+import sys
 import asyncio
 import json
 import re
-from datetime import datetime
+import logging
+import traceback
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Dict
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BotCommand
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.types import Message, BotCommand, Update
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger("moderator_bot")
 
 TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_THREAD_ID = 3447
@@ -16,48 +28,122 @@ ALLOWED_THREAD_ID = 3447
 WARNINGS_FILE = "warnings.json"
 SETTINGS_FILE = "settings.json"
 
+WATCHDOG_INTERVAL_SEC = int(os.getenv("WATCHDOG_INTERVAL_SEC", "60"))
+API_CHECK_TIMEOUT_SEC = int(os.getenv("API_CHECK_TIMEOUT_SEC", "15"))
+POLLING_RESTART_DELAY_SEC = int(os.getenv("POLLING_RESTART_DELAY_SEC", "5"))
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
+bot_state: Dict[str, Any] = {
+    "polling_active": False,
+    "last_update_at": None,
+    "last_handler_at": None,
+    "last_api_check_at": None,
+    "last_api_ok": None,
+    "last_api_error": None,
+    "updates_handled": 0,
+    "handler_errors": 0,
+    "polling_restarts": 0,
+    "started_at": datetime.now(timezone.utc).isoformat(),
+}
+
 LINK_PATTERN = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def mark_update_received() -> None:
+    now = utc_now().isoformat()
+    bot_state["last_update_at"] = now
+    bot_state["updates_handled"] += 1
+
+
+def mark_handler_finished() -> None:
+    bot_state["last_handler_at"] = utc_now().isoformat()
+
+
+class ActivityMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Update, Dict[str, Any]], Awaitable[Any]],
+        event: Update,
+        data: Dict[str, Any],
+    ) -> Any:
+        mark_update_received()
+        event_name = type(event).__name__
+        logger.info("Incoming update: %s", event_name)
+        try:
+            result = await handler(event, data)
+            mark_handler_finished()
+            logger.info("Handled update: %s", event_name)
+            return result
+        except Exception:
+            bot_state["handler_errors"] += 1
+            logger.exception("Handler error for update: %s", event_name)
+            raise
+
+
+dp.update.middleware(ActivityMiddleware())
+
+
+@dp.errors()
+async def dispatcher_errors_handler(event: Update, exception: Exception):
+    bot_state["handler_errors"] += 1
+    logger.exception("Unhandled dispatcher error: %s", exception)
+    return True
+
 
 def load_warnings():
     try:
         with open(WARNINGS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception as exc:
+        logger.warning("Failed to load warnings: %s", exc)
         return {}
+
 
 def save_warnings(data):
     with open(WARNINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+
 def load_settings():
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception as exc:
+        logger.warning("Failed to load settings: %s", exc)
         return {"max_warnings": 5, "welcome_enabled": True}
+
 
 def save_settings(data):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+
 warnings = load_warnings()
 settings = load_settings()
+
 
 def contains_link(text: str) -> bool:
     return bool(LINK_PATTERN.search(text)) if text else False
 
+
 def is_bybit_link(text: str) -> bool:
     return "i.bybit.com" in text.lower() if text else False
+
 
 async def get_admins(chat_id):
     try:
         admins = await bot.get_chat_administrators(chat_id)
         return [admin.user.id for admin in admins]
-    except:
+    except Exception as exc:
+        logger.warning("Failed to fetch admins for chat %s: %s", chat_id, exc)
         return []
+
 
 @dp.message(Command("stats"))
 async def show_stats(message: Message):
@@ -71,6 +157,7 @@ async def show_stats(message: Message):
     for uid, count in list(warnings.items())[:10]:
         text += f"👤 ID: {uid} → {count}/{settings['max_warnings']}\n"
     await message.answer(text)
+
 
 @dp.message(Command("clear_warnings"))
 async def clear_warnings_cmd(message: Message):
@@ -89,6 +176,7 @@ async def clear_warnings_cmd(message: Message):
     else:
         await message.answer(f"❌ Нет предупреждений у {target}")
 
+
 @dp.message(Command("set_warnings"))
 async def set_max_warnings(message: Message):
     if message.from_user.id not in await get_admins(message.chat.id):
@@ -106,34 +194,52 @@ async def set_max_warnings(message: Message):
             await message.answer(f"✅ Лимит изменён на {new_max}")
         else:
             await message.answer("❌ Число от 1 до 20")
-    except:
+    except Exception:
         await message.answer("❌ Введите число")
+
 
 @dp.message(Command("info"))
 async def bot_info(message: Message):
-    await message.answer(f"🤖 Бот-модератор\n📌 Разрешённая папка: {ALLOWED_THREAD_ID}\n⚠️ Лимит: {settings['max_warnings']}\n📊 Активных: {len(warnings)}")
+    await message.answer(
+        f"🤖 Бот-модератор\n"
+        f"📌 Разрешённая папка: {ALLOWED_THREAD_ID}\n"
+        f"⚠️ Лимит: {settings['max_warnings']}\n"
+        f"📊 Активных: {len(warnings)}"
+    )
+
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
-    await message.answer(f"🛡️ Правила:\n• Ссылки только в папке ОБМЕННИК\n• i.bybit.com — только в ОБМЕННИКЕ\n• {settings['max_warnings']} нарушений → бан\n\nКоманды:\n/stats\n/clear_warnings\n/set_warnings\n/info\n/help")
+    await message.answer(
+        f"🛡️ Правила:\n"
+        f"• Ссылки только в папке ОБМЕННИК\n"
+        f"• i.bybit.com — только в ОБМЕННИКЕ\n"
+        f"• {settings['max_warnings']} нарушений → бан\n\n"
+        f"Команды:\n/stats\n/clear_warnings\n/set_warnings\n/info\n/help"
+    )
+
 
 @dp.message(F.new_chat_members)
 async def welcome_new_member(message: Message):
     for member in message.new_chat_members:
         if member.id != bot.id:
-            await message.answer(f"👋 Добро пожаловать, {member.full_name}!\n📌 Ссылки только в папке «ОБМЕННИК»")
+            await message.answer(
+                f"👋 Добро пожаловать, {member.full_name}!\n"
+                f"📌 Ссылки только в папке «ОБМЕННИК»"
+            )
+
 
 @dp.message()
 async def check_links(message: Message):
-    if message.text and message.text.startswith('/'):
+    if message.text and message.text.startswith("/"):
         return
     if message.from_user.is_bot:
         return
     if not message.text:
         return
 
-    thread_id = getattr(message, 'message_thread_id', None)
-    
+    thread_id = getattr(message, "message_thread_id", None)
+
     if is_bybit_link(message.text):
         if thread_id != ALLOWED_THREAD_ID:
             await message.delete()
@@ -142,22 +248,24 @@ async def check_links(message: Message):
             save_warnings(warnings)
             attempts = warnings[user_id]
             max_w = settings["max_warnings"]
-            await message.answer(f"⚠️ {message.from_user.full_name}, ордера разрешены только в разделе «ОБМЕННИК»\n📌 Предупреждение: {attempts}/{max_w}")
+            await message.answer(
+                f"⚠️ {message.from_user.full_name}, ордера разрешены только в разделе «ОБМЕННИК»\n"
+                f"📌 Предупреждение: {attempts}/{max_w}"
+            )
             if attempts >= max_w:
                 try:
                     await bot.ban_chat_member(message.chat.id, message.from_user.id)
                     await message.answer(f"🚫 {message.from_user.full_name} заблокирован")
                     warnings.pop(user_id, None)
                     save_warnings(warnings)
-                except Exception as e:
-                    print(f"Ошибка бана: {e}")
+                except Exception as exc:
+                    logger.exception("Ban failed for user %s: %s", user_id, exc)
             return
-        else:
-            return
-    
+        return
+
     if not contains_link(message.text):
         return
-    
+
     if thread_id == ALLOWED_THREAD_ID:
         return
 
@@ -167,17 +275,21 @@ async def check_links(message: Message):
     save_warnings(warnings)
     attempts = warnings[user_id]
     max_w = settings["max_warnings"]
-    
+
     if attempts < max_w:
-        await message.answer(f"⚠️ {message.from_user.full_name}, ссылки здесь запрещены!\n📌 Предупреждение: {attempts}/{max_w}")
+        await message.answer(
+            f"⚠️ {message.from_user.full_name}, ссылки здесь запрещены!\n"
+            f"📌 Предупреждение: {attempts}/{max_w}"
+        )
     else:
         try:
             await bot.ban_chat_member(message.chat.id, message.from_user.id)
             await message.answer(f"🚫 {message.from_user.full_name} заблокирован")
             warnings.pop(user_id, None)
             save_warnings(warnings)
-        except Exception as e:
-            print(f"Ошибка бана: {e}")
+        except Exception as exc:
+            logger.exception("Ban failed for user %s: %s", user_id, exc)
+
 
 async def set_commands():
     commands = [
@@ -189,11 +301,105 @@ async def set_commands():
     ]
     await bot.set_my_commands(commands)
 
-async def handle_root(_request):
-    return web.Response(text="Bot is running")
 
-async def handle_health(_request):
-    return web.Response(status=200)
+async def check_telegram_api() -> bool:
+    bot_state["last_api_check_at"] = utc_now().isoformat()
+    try:
+        me = await asyncio.wait_for(bot.get_me(), timeout=API_CHECK_TIMEOUT_SEC)
+        bot_state["last_api_ok"] = True
+        bot_state["last_api_error"] = None
+        logger.info("Telegram API check OK: @%s", me.username)
+        return True
+    except Exception as exc:
+        bot_state["last_api_ok"] = False
+        bot_state["last_api_error"] = repr(exc)
+        logger.exception("Telegram API check failed")
+        return False
+
+
+def is_bot_healthy() -> bool:
+    return bool(bot_state["polling_active"] and bot_state["last_api_ok"])
+
+
+async def watchdog():
+    logger.info(
+        "Watchdog started (interval=%ss, api_timeout=%ss)",
+        WATCHDOG_INTERVAL_SEC,
+        API_CHECK_TIMEOUT_SEC,
+    )
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL_SEC)
+        api_ok = await check_telegram_api()
+        logger.info(
+            "Watchdog heartbeat: polling_active=%s api_ok=%s updates=%s handler_errors=%s restarts=%s last_update=%s",
+            bot_state["polling_active"],
+            api_ok,
+            bot_state["updates_handled"],
+            bot_state["handler_errors"],
+            bot_state["polling_restarts"],
+            bot_state["last_update_at"],
+        )
+        if not bot_state["polling_active"]:
+            logger.error("Watchdog detected inactive polling")
+
+
+async def run_bot():
+    while True:
+        try:
+            bot_state["polling_active"] = True
+            await bot.delete_webhook(drop_pending_updates=False)
+            await set_commands()
+            logger.info("Starting Telegram polling")
+            await dp.start_polling(bot, handle_signals=False)
+            logger.warning("Polling exited without exception")
+        except asyncio.CancelledError:
+            bot_state["polling_active"] = False
+            logger.info("Polling task cancelled")
+            raise
+        except Exception:
+            logger.exception("Polling crashed")
+        finally:
+            bot_state["polling_active"] = False
+
+        bot_state["polling_restarts"] += 1
+        logger.warning(
+            "Restarting polling in %ss (restart #%s)",
+            POLLING_RESTART_DELAY_SEC,
+            bot_state["polling_restarts"],
+        )
+        await asyncio.sleep(POLLING_RESTART_DELAY_SEC)
+
+
+async def handle_root(_request):
+    status = "healthy" if is_bot_healthy() else "degraded"
+    return web.json_response(
+        {
+            "status": status,
+            "message": "Bot is running",
+            "polling_active": bot_state["polling_active"],
+            "last_api_ok": bot_state["last_api_ok"],
+            "last_update_at": bot_state["last_update_at"],
+            "updates_handled": bot_state["updates_handled"],
+        }
+    )
+
+
+async def handle_health(request):
+    healthy = is_bot_healthy()
+    payload = {
+        "status": "ok" if healthy else "degraded",
+        "polling_active": bot_state["polling_active"],
+        "last_api_ok": bot_state["last_api_ok"],
+        "last_api_check_at": bot_state["last_api_check_at"],
+        "last_update_at": bot_state["last_update_at"],
+        "last_handler_at": bot_state["last_handler_at"],
+        "updates_handled": bot_state["updates_handled"],
+        "handler_errors": bot_state["handler_errors"],
+        "polling_restarts": bot_state["polling_restarts"],
+        "last_api_error": bot_state["last_api_error"],
+    }
+    return web.json_response(payload, status=200 if healthy else 503)
+
 
 async def start_health_server():
     app = web.Application()
@@ -204,19 +410,45 @@ async def start_health_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Health server listening on 0.0.0.0:{port}")
+    logger.info("Health server listening on 0.0.0.0:%s", port)
 
-async def run_bot():
-    await set_commands()
-    await dp.start_polling(bot)
+
+def install_global_error_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    def handle_async_exception(_loop, context):
+        message = context.get("message", "Unhandled asyncio exception")
+        exc = context.get("exception")
+        if exc:
+            logger.error("%s\n%s", message, "".join(traceback.format_exception(exc)))
+        else:
+            logger.error("Asyncio context error: %s", context)
+
+    loop.set_exception_handler(handle_async_exception)
+
+    def handle_uncaught(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        logger.critical(
+            "Uncaught exception:\n%s",
+            "".join(traceback.format_exception(exc_type, exc, tb)),
+        )
+
+    sys.excepthook = handle_uncaught
+
 
 async def main():
-    print("=" * 50)
-    print("🚀 БОТ ЗАПУЩЕН")
-    print(f"✅ Папка «ОБМЕННИК» (ID: {ALLOWED_THREAD_ID})")
-    print(f"⚠️ Максимум предупреждений: {settings['max_warnings']}")
-    print("=" * 50)
-    await asyncio.gather(start_health_server(), run_bot())
+    loop = asyncio.get_running_loop()
+    install_global_error_handlers(loop)
+
+    logger.info("=" * 50)
+    logger.info("BOT STARTED")
+    logger.info("Allowed thread ID: %s", ALLOWED_THREAD_ID)
+    logger.info("Max warnings: %s", settings["max_warnings"])
+    logger.info("=" * 50)
+
+    await check_telegram_api()
+    await asyncio.gather(start_health_server(), watchdog(), run_bot())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
