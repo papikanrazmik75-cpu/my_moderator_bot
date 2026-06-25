@@ -4,6 +4,7 @@ import json
 import re
 from datetime import datetime
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BotCommand
 from aiogram.filters import Command
@@ -188,14 +189,34 @@ async def set_commands():
     ]
     await bot.set_my_commands(commands)
 
+async def handle_root(_request):
+    return web.Response(text="Bot is running")
+
+async def handle_health(_request):
+    return web.Response(status=200)
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server listening on 0.0.0.0:{port}")
+
+async def run_bot():
+    await set_commands()
+    await dp.start_polling(bot)
+
 async def main():
     print("=" * 50)
     print("🚀 БОТ ЗАПУЩЕН")
     print(f"✅ Папка «ОБМЕННИК» (ID: {ALLOWED_THREAD_ID})")
     print(f"⚠️ Максимум предупреждений: {settings['max_warnings']}")
     print("=" * 50)
-    await set_commands()
-    await dp.start_polling(bot)
+    await asyncio.gather(start_health_server(), run_bot())
 
 if __name__ == "__main__":
     asyncio.run(main())
